@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.skill-router/
+.venv/
+dist/
+build/
+*.egg-info/
+skills/**
+.mcp.json
