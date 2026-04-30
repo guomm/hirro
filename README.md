@@ -102,12 +102,14 @@ It also supports the older local `servers` shape for stdio servers:
 }
 ```
 
-At startup, the router calls `tools/list` on each configured MCP server and
-includes only MCP server summaries in the model's capability catalog. Tool
-details are loaded on demand with `list_tools`. If the model selects an MCP
-tool, the router calls `tools/call` with the model-provided arguments. HTTP
-servers are called with JSON-RPC POST requests and support JSON or SSE JSON
-responses.
+At startup, the router includes only MCP server summaries in the model's
+runtime context. Tool details are loaded on demand with `list_tools`. If the
+model selects an MCP tool, the router calls `tools/call` with the
+model-provided arguments. HTTP servers are called with JSON-RPC POST requests
+and support JSON or SSE JSON responses.
+
+Context compression design notes are documented in
+[docs/context-compression.md](d:/git_task/hirro/docs/context-compression.md).
 
 ## Skill Manifest
 

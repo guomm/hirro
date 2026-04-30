@@ -149,6 +149,9 @@ class McpToolRegistry:
     def has_loaded_server(self, server_name: str) -> bool:
         return server_name in self._loaded_servers
 
+    def loaded_server_names(self) -> list[str]:
+        return sorted(self._loaded_servers)
+
     def execute(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         server = self.config.servers.get(server_name)
         if server is None:
