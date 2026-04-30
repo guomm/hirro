@@ -3,11 +3,13 @@ from __future__ import annotations
 import subprocess
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from skill_router.agent import AgentRunner
+from skill_router.context import ArtifactStore, ConversationMemory, summarize_payload
 from skill_router.mcp import McpConfig, McpToolRegistry
 from skill_router.models import CommandSpec, Skill, SkillRouterError, ToolSpec
-from skill_router.tools import default_tool_registry
+from skill_router.tools import ToolRegistry, default_tool_registry
 
 
 class FakeClient:
@@ -50,6 +52,15 @@ class FakeMcpTools:
         self.calls = []
         self.discover_calls = []
         self.loaded_servers = set()
+        self._tools = [
+            ToolSpec(
+                name="precheck_sql",
+                description="Precheck SQL",
+                args={"sql": "string"},
+                source="mcp",
+                server="impala-query-mcp",
+            )
+        ]
 
     def server_summaries(self):
         return [
@@ -61,20 +72,16 @@ class FakeMcpTools:
         ]
 
     def specs(self):
-        return []
+        return [
+            tool
+            for tool in self._tools
+            if tool.server in self.loaded_servers
+        ]
 
     def specs_for_server(self, server_name):
         self.discover_calls.append(server_name)
         self.loaded_servers.add(server_name)
-        return [
-            ToolSpec(
-                name="precheck_sql",
-                description="Precheck SQL",
-                args={"sql": "string"},
-                source="mcp",
-                server="impala-query-mcp",
-            )
-        ]
+        return [tool for tool in self._tools if tool.server == server_name]
 
     def execute(self, server_name, tool_name, arguments):
         self.calls.append((server_name, tool_name, arguments))
@@ -82,6 +89,9 @@ class FakeMcpTools:
 
     def has_loaded_server(self, server_name):
         return server_name in self.loaded_servers
+
+    def loaded_server_names(self):
+        return sorted(self.loaded_servers)
 
 
 def make_agent(client, skills=None, executor=None, mcp_tools=None) -> AgentRunner:
@@ -154,7 +164,8 @@ class AgentRunnerTests(unittest.TestCase):
 
         self.assertEqual(result.content, "2 + 3 = 5")
         self.assertIn('"result": 5', client.messages[1][-1]["content"])
-        self.assertEqual(len(result.messages), 4)
+        self.assertEqual(len(result.messages), 3)
+        self.assertIn("Turn summary:", result.messages[1]["content"])
 
     def test_requires_skill_activation_before_execution(self) -> None:
         client = FakeClient(
@@ -282,6 +293,34 @@ class AgentRunnerTests(unittest.TestCase):
             for call_messages in client.messages
             for message in call_messages
         )
+        self.assertIn("Expected non-empty string field: name", all_message_text)
+
+    def test_invalid_function_call_envelope_is_returned_to_model_for_repair(self) -> None:
+        client = FakeClient(
+            [
+                {
+                    "type": "function_call",
+                    "arguments": {"name": "echo"},
+                },
+                {
+                    "type": "function_call",
+                    "name": "activate_skill",
+                    "arguments": {"name": "echo"},
+                },
+                {"type": "final", "content": "Activated echo."},
+            ]
+        )
+        agent = make_agent(client, skills=[make_skill()])
+
+        result = agent.run("use echo")
+
+        self.assertEqual(result.content, "Activated echo.")
+        all_message_text = "\n".join(
+            message["content"]
+            for call_messages in client.messages
+            for message in call_messages
+        )
+        self.assertIn("__invalid_function_call__", all_message_text)
         self.assertIn("Expected non-empty string field: name", all_message_text)
 
     def test_call_tool_executes_mcp_tool_with_uniform_fields(self) -> None:
@@ -454,10 +493,189 @@ class AgentRunnerTests(unittest.TestCase):
         agent.run("hello")
 
         system_prompt = client.messages[0][0]["content"]
-        self.assertIn("mcp_servers", system_prompt)
-        self.assertIn("impala-query-mcp", system_prompt)
-        self.assertNotIn('"mcp_tools"', system_prompt)
+        runtime_context = client.messages[0][1]["content"]
+        self.assertNotIn('"mcp_servers"', system_prompt)
+        self.assertIn("Runtime context:", runtime_context)
+        self.assertIn('"mcp_servers"', runtime_context)
+        self.assertIn("impala-query-mcp", runtime_context)
+        self.assertNotIn('"mcp_tools"', runtime_context)
+        self.assertIn('"loaded_tools": []', runtime_context)
+        self.assertIn('"loaded_servers": []', runtime_context)
+        self.assertIn('"activated_skills": []', runtime_context)
         self.assertEqual(mcp_tools.discover_calls, [])
+
+    def test_runtime_context_includes_loaded_tool_minimal_schema_after_list_tools(self) -> None:
+        mcp_tools = FakeMcpTools()
+        first_client = FakeClient(
+            [
+                {
+                    "type": "function_call",
+                    "name": "list_tools",
+                    "arguments": {"server": "impala-query-mcp"},
+                },
+                {"type": "final", "content": "Loaded tools."},
+            ]
+        )
+        agent = make_agent(first_client, mcp_tools=mcp_tools)
+        agent.run("load tools")
+
+        second_client = FakeClient([{"type": "final", "content": "ok"}])
+        agent.client = second_client
+        agent.run("next turn")
+
+        runtime_context = second_client.messages[0][1]["content"]
+        self.assertIn('"loaded_servers": ["impala-query-mcp"]', runtime_context)
+        self.assertIn('"loaded_tools": [{"server": "impala-query-mcp", "name": "precheck_sql", "args": {"sql": "string"}}]', runtime_context)
+
+    def test_runtime_context_includes_activated_skills(self) -> None:
+        client = FakeClient(
+            [
+                {
+                    "type": "function_call",
+                    "name": "activate_skill",
+                    "arguments": {"name": "echo"},
+                },
+                {"type": "final", "content": "Activated."},
+            ]
+        )
+        agent = make_agent(client, skills=[make_skill()])
+        agent.run("use echo")
+
+        next_client = FakeClient([{"type": "final", "content": "ok"}])
+        agent.client = next_client
+        agent.run("next turn")
+
+        runtime_context = next_client.messages[0][1]["content"]
+        self.assertIn('"activated_skills": ["echo"]', runtime_context)
+
+    def test_large_tool_result_is_compacted_into_artifact(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="big_result",
+                description="Return a large payload.",
+                args={"text": "string"},
+            ),
+            lambda arguments: {"blob": arguments["text"] * 800},
+        )
+        client = FakeClient(
+            [
+                {
+                    "type": "function_call",
+                    "name": "call_tool",
+                    "arguments": {
+                        "name": "big_result",
+                        "args": {"text": "abcdef"},
+                    },
+                },
+                {"type": "final", "content": "Stored the large result."},
+            ]
+        )
+        with TemporaryDirectory() as raw:
+            agent = AgentRunner(
+                client=client,
+                skills=[],
+                builtin_tools=registry,
+                mcp_tools=McpToolRegistry(McpConfig([])),
+                executor=FakeExecutor(),
+                artifact_store=ArtifactStore(Path(raw)),
+                max_inline_result_chars=200,
+            )
+
+            result = agent.run("generate large output")
+
+        self.assertEqual(result.content, "Stored the large result.")
+        self.assertIn("artifact=", result.messages[1]["content"])
+        self.assertIn('"artifact_id": "call_tool-', client.messages[1][-1]["content"])
+        self.assertIn('"full_result_omitted": true', client.messages[1][-1]["content"])
+
+    def test_generic_mcp_payload_summary_keeps_high_signal_fields(self) -> None:
+        summary = summarize_payload(
+            {
+                "ok": True,
+                "message": "query executed successfully",
+                "data": [
+                    {"dt": "2026-04-29", "count": 12, "table": "dwd.demo"},
+                    {"dt": "2026-04-28", "count": 9, "table": "dwd.demo"},
+                ],
+                "meta": {"row_count": 2, "elapsed_ms": 31},
+            }
+        )
+
+        self.assertIn("ok=True", summary)
+        self.assertIn("message=query executed successfully", summary)
+        self.assertIn("data=list[2]{dt, count, table}", summary)
+        self.assertIn("meta{row_count=2", summary)
+
+    def test_conversation_memory_rolls_old_turns_into_summary(self) -> None:
+        memory = ConversationMemory(max_turns=1, keep_last_turns=1)
+        memory.append_turn(
+            [
+                {"role": "user", "content": "first task"},
+                {"role": "assistant", "content": "Turn summary:\n- did first"},
+                {"role": "assistant", "content": "first answer"},
+            ]
+        )
+        memory.append_turn(
+            [
+                {"role": "user", "content": "second task"},
+                {"role": "assistant", "content": "Turn summary:\n- did second"},
+                {"role": "assistant", "content": "second answer"},
+            ]
+        )
+
+        history = memory.export()
+
+        self.assertEqual(history[0]["role"], "assistant")
+        self.assertIn("Conversation summary:", history[0]["content"])
+        self.assertIn("user=first task", history[0]["content"])
+        self.assertIn("steps=- did first", history[0]["content"])
+        self.assertIn("answer=first answer", history[0]["content"])
+        self.assertIn("second answer", history[-1]["content"])
+
+    def test_conversation_memory_prefers_llm_summary_after_threshold(self) -> None:
+        captured_turns = []
+        logs = []
+
+        def summarizer(turns):
+            captured_turns.append(turns)
+            return "llm summary: task one completed, task two pending"
+
+        memory = ConversationMemory(
+            max_turns=2,
+            keep_last_turns=1,
+            summarizer=summarizer,
+            logger=logs.append,
+        )
+        memory.append_turn(
+            [
+                {"role": "user", "content": "task one"},
+                {"role": "assistant", "content": "Turn summary:\n- did one"},
+                {"role": "assistant", "content": "done one"},
+            ]
+        )
+        memory.append_turn(
+            [
+                {"role": "user", "content": "task two"},
+                {"role": "assistant", "content": "Turn summary:\n- did two"},
+                {"role": "assistant", "content": "done two"},
+            ]
+        )
+        memory.append_turn(
+            [
+                {"role": "user", "content": "task three"},
+                {"role": "assistant", "content": "Turn summary:\n- did three"},
+                {"role": "assistant", "content": "done three"},
+            ]
+        )
+
+        history = memory.export()
+
+        self.assertEqual(len(captured_turns), 1)
+        self.assertIn("llm summary: task one completed, task two pending", history[0]["content"])
+        self.assertEqual(len(logs), 1)
+        self.assertIn("context compression triggered", logs[0])
+        self.assertIn("using llm summary", logs[0])
 
 
 if __name__ == "__main__":

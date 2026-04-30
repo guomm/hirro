@@ -5,6 +5,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from skill_router.context import (
+    ArtifactStore,
+    TurnCompressor,
+)
 from skill_router.executor import Executor
 from skill_router.llm import LLMClient
 from skill_router.mcp import McpToolRegistry
@@ -28,6 +32,8 @@ class AgentRunner:
         executor: Executor,
         max_steps: int = 10,
         verbose: bool = False,
+        artifact_store: Optional[ArtifactStore] = None,
+        max_inline_result_chars: int = 4000,
     ):
         self.client = client
         self.skills = {skill.name: skill for skill in skills}
@@ -36,6 +42,8 @@ class AgentRunner:
         self.executor = executor
         self.max_steps = max_steps
         self.verbose = verbose
+        self.artifact_store = artifact_store
+        self.max_inline_result_chars = max_inline_result_chars
         self._activated_skills: set[str] = set()
 
     def run(
@@ -45,8 +53,14 @@ class AgentRunner:
         dry_run: bool = False,
     ) -> AgentResult:
         turn_messages: list[dict[str, str]] = [{"role": "user", "content": user_input}]
+        compressor = TurnCompressor(
+            user_input=user_input,
+            artifact_store=self.artifact_store,
+            max_inline_result_chars=self.max_inline_result_chars,
+        )
         messages = [
             {"role": "system", "content": self._system_prompt()},
+            {"role": "assistant", "content": self._runtime_context_message()},
             *(history or []),
             *turn_messages,
         ]
@@ -62,27 +76,55 @@ class AgentRunner:
             envelope_type = envelope.get("type")
             if envelope_type == "final":
                 content = _require_string(envelope, "content")
-                turn_messages.append({"role": "assistant", "content": content})
-                return AgentResult(content=content, messages=turn_messages)
+                return AgentResult(
+                    content=content,
+                    messages=compressor.build_turn_messages(content),
+                )
 
             if envelope_type != "function_call":
                 raise SkillRouterError(
                     "Agent response must be a final answer or function_call"
                 )
 
-            name = _require_string(envelope, "name")
-            arguments = envelope.get("arguments", {})
-            if not isinstance(arguments, dict):
-                raise SkillRouterError("Function call arguments must be an object")
+            try:
+                response_name = _require_string(envelope, "name")
+                arguments = envelope.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    raise SkillRouterError("Function call arguments must be an object")
+                name = response_name
+            except SkillRouterError as exc:
+                invalid_text = json.dumps(envelope, ensure_ascii=False)
+                messages.append({"role": "assistant", "content": invalid_text})
+                repair_result = {
+                    "ok": False,
+                    "error": str(exc),
+                    "hint": (
+                        "Return a valid function_call JSON object. "
+                        "Every function_call must include a non-empty string field 'name' "
+                        "and an object field 'arguments'."
+                    ),
+                }
+                repair_text = json.dumps(
+                    {
+                        "type": "function_result",
+                        "name": envelope.get("name", "__invalid_function_call__"),
+                        "result": repair_result,
+                    },
+                    ensure_ascii=False,
+                )
+                messages.append({"role": "user", "content": repair_text})
+                compressor.note_invalid_function_call(exc)
+                continue
 
             call_text = json.dumps(envelope, ensure_ascii=False)
             turn_messages.append({"role": "assistant", "content": call_text})
             messages.append({"role": "assistant", "content": call_text})
 
             if dry_run:
-                content = f"Planned function call: {call_text}"
-                turn_messages.append({"role": "assistant", "content": content})
-                return AgentResult(content=content, messages=turn_messages)
+                return AgentResult(
+                    content=f"Planned function call: {call_text}",
+                    messages=compressor.record_dry_run(call_text),
+                )
 
             try:
                 result = self._call_function(name, arguments)
@@ -95,11 +137,11 @@ class AgentRunner:
                         "You may call list_capabilities or activate_skill to inspect valid names."
                     ),
                 }
+            result = compressor.record_function_result(name, arguments, result)
             result_text = json.dumps(
-                {"type": "function_result", "name": name, "result": result},
+                {"type": "function_result", "name": response_name, "result": result},
                 ensure_ascii=False,
             )
-            turn_messages.append({"role": "user", "content": result_text})
             messages.append({"role": "user", "content": result_text})
 
         raise SkillRouterError(f"Agent exceeded max_steps={self.max_steps}")
@@ -129,6 +171,9 @@ class AgentRunner:
                 _tool_to_dict(tool) for tool in self.builtin_tools.specs()
             ],
             "mcp_servers": self.mcp_tools.server_summaries(),
+            "loaded_tools": self._loaded_tool_summaries(),
+            "loaded_servers": self.mcp_tools.loaded_server_names(),
+            "activated_skills": sorted(self._activated_skills),
         }
 
     def _list_tools(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -255,6 +300,17 @@ class AgentRunner:
         matches = [tool for tool in self.builtin_tools.specs() if tool.name == name]
         return matches[0] if len(matches) == 1 else None
 
+    def _loaded_tool_summaries(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "server": tool.server,
+                "name": tool.name,
+                "args": tool.args,
+            }
+            for tool in self.mcp_tools.specs()
+            if tool.server is not None
+        ]
+
     def _suggest_mcp_servers(self, skill: Skill) -> list[str]:
         known_servers = {server["name"]: server for server in self.mcp_tools.server_summaries()}
         referenced = _extract_qualified_tool_refs(skill.body)
@@ -292,7 +348,6 @@ class AgentRunner:
             )
 
     def _system_prompt(self) -> str:
-        capabilities = self._list_capabilities()
         return (
             "You are a local tool-using agent. Return exactly one JSON object per turn.\n"
             'Final answer: {"type":"final","content":"..."}\n'
@@ -307,12 +362,16 @@ class AgentRunner:
             "Rules: use only these function names; use name/args/server consistently; "
             "when calling an MCP tool, use name='server.tool' or pass server explicitly; "
             "before calling any MCP tool, call list_tools for its server and use the returned schema; "
+            "use the runtime context message for available capabilities and loaded runtime state; "
             "after activating a skill, prefer its suggested_mcp_servers for list_tools; "
             "activate a skill before running its command or script; follow activated skill "
             "Markdown as workflow instructions; do not invent capability names; on function "
-            "errors, fix the next call or explain the error.\n"
-            "Capabilities: " + json.dumps(capabilities, ensure_ascii=False)
+            "errors, fix the next call or explain the error."
         )
+
+    def _runtime_context_message(self) -> str:
+        runtime = self._list_capabilities()
+        return "Runtime context: " + json.dumps(runtime, ensure_ascii=False)
 
 
 def _tool_to_dict(tool: ToolSpec) -> dict[str, Any]:

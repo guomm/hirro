@@ -3,9 +3,10 @@ from __future__ import annotations
 import ast
 import operator
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
+from skill_router.context import ArtifactStore
 from skill_router.executor import validate_schema_arguments
 from skill_router.models import SkillRouterError, ToolSpec
 
@@ -34,7 +35,7 @@ class ToolRegistry:
         return func(arguments)
 
 
-def default_tool_registry() -> ToolRegistry:
+def default_tool_registry(artifact_store: Optional[ArtifactStore] = None) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolSpec(
@@ -60,6 +61,15 @@ def default_tool_registry() -> ToolRegistry:
         ),
         _text_stats,
     )
+    if artifact_store is not None:
+        registry.register(
+            ToolSpec(
+                name="read_artifact",
+                description="Read a stored large result artifact by id.",
+                args={"artifact_id": "string", "max_chars": "integer"},
+            ),
+            lambda arguments: _read_artifact(artifact_store, arguments),
+        )
     return registry
 
 
@@ -88,6 +98,20 @@ def _text_stats(arguments: dict[str, Any]) -> dict[str, Any]:
         "characters": len(text),
         "words": len(text.split()),
         "lines": 0 if text == "" else text.count("\n") + 1,
+    }
+
+
+def _read_artifact(store: ArtifactStore, arguments: dict[str, Any]) -> dict[str, Any]:
+    artifact_id = arguments["artifact_id"]
+    max_chars = arguments["max_chars"]
+    if max_chars <= 0:
+        raise SkillRouterError("read_artifact.max_chars must be greater than 0")
+    content = store.read_text(artifact_id)
+    truncated = len(content) > max_chars
+    return {
+        "artifact_id": artifact_id,
+        "content": content[:max_chars],
+        "truncated": truncated,
     }
 
 

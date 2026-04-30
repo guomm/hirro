@@ -10,6 +10,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from skill_router.agent import AgentRunner
+from skill_router.context import ArtifactStore, ConversationMemory
 from skill_router.executor import Executor
 from skill_router.llm import LLMClient
 from skill_router.loader import SkillLoader
@@ -67,11 +68,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         skills = SkillLoader(Path(args.skills_dir)).load_optional()
-        builtin_tools = default_tool_registry()
+        artifact_store = ArtifactStore(Path(".skill-router") / "artifacts")
+        builtin_tools = default_tool_registry(artifact_store=artifact_store)
         mcp_tools = McpToolRegistry(McpConfig.load_optional(args.mcp_config))
         client = LLMClient(
             model=args.model,
             base_url=args.base_url,
+            api_key="sk-6c1cf3350fc94e3e8f3e6a9fa7ef6684",
         )
         executor = Executor(WhitelistStore(args.whitelist))
         agent = AgentRunner(
@@ -81,6 +84,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             mcp_tools=mcp_tools,
             executor=executor,
             verbose=args.verbose,
+            artifact_store=artifact_store,
         )
 
         if args.chat or args.task is None:
@@ -98,7 +102,10 @@ def _run_chat(
     agent: AgentRunner,
     plan_only: bool,
 ) -> int:
-    history: list[dict[str, str]] = []
+    memory = ConversationMemory(
+        summarizer=_make_memory_summarizer(agent.client),
+        logger=print if agent.verbose else None,
+    )
     print("Skill Router chat. Type /exit or /quit to stop.")
     while True:
         try:
@@ -111,13 +118,46 @@ def _run_chat(
         if task in {"/exit", "/quit"}:
             return 0
         try:
-            result = agent.run(task, history=history, dry_run=plan_only)
+            result = agent.run(task, history=memory.export(), dry_run=plan_only)
             print(result.content)
-            history.extend(result.messages)
+            memory.append_turn(result.messages)
         except SkillRouterError as exc:
             print(f"error: {exc}", file=sys.stderr)
-            history.append({"role": "user", "content": task})
-            history.append({"role": "assistant", "content": f"error: {exc}"})
+            memory.append_error(task, str(exc))
+
+
+def _make_memory_summarizer(client: LLMClient):
+    def summarize(turns: list[list[dict[str, str]]]) -> str:
+        transcript_lines: list[str] = []
+        for index, turn in enumerate(turns, start=1):
+            transcript_lines.append(f"Turn {index}:")
+            for message in turn:
+                role = message.get("role", "assistant")
+                content = message.get("content", "")
+                transcript_lines.append(f"{role}: {content}")
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize old chat turns for future continuation. "
+                    "Return exactly one JSON object with a string field 'summary'. "
+                    "Focus on user goals, completed actions, important results, active skills, "
+                    "loaded servers or tools when relevant, and pending follow-ups. "
+                    "Keep it compact and factual."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "\n".join(transcript_lines),
+            },
+        ]
+        response = client.complete_json(messages)
+        summary = response.get("summary", "")
+        if not isinstance(summary, str):
+            return ""
+        return " ".join(summary.split()).strip()
+
+    return summarize
 
 
 if __name__ == "__main__":
