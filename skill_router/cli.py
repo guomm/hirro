@@ -74,7 +74,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         client = LLMClient(
             model=args.model,
             base_url=args.base_url,
-            api_key="sk-6c1cf3350fc94e3e8f3e6a9fa7ef6684",
         )
         executor = Executor(WhitelistStore(args.whitelist))
         agent = AgentRunner(
